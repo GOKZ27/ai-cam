@@ -14,15 +14,18 @@ import os
 import re
 import threading
 import time
+import uuid
 from collections import Counter
 from contextlib import asynccontextmanager
 
 import requests
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from PIL import Image, ImageOps, UnidentifiedImageError
 from PIL import ImageStat
 from ultralytics import YOLO
+
+SERVICE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 try:  # SDK resmi Google Gen AI; opsional agar layanan tetap jalan tanpanya.
     from google import genai as genai_sdk
@@ -69,7 +72,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ai_cam")
 
-load_env_file(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+load_env_file(os.path.join(SERVICE_DIR, ".env"))
 
 
 @asynccontextmanager
@@ -80,6 +83,13 @@ async def lifespan(_app: FastAPI):
             logger.info("model YOLO siap (preload %s)", os.getenv("YOLO_MODEL", "yolo11s.pt"))
         except Exception:  # pragma: no cover - bergantung file model
             logger.exception("gagal memuat model YOLO saat startup")
+    if YOLO_CUSTOM_MODEL:
+        try:
+            custom = get_custom_model()
+            if custom is not None:
+                logger.info("model custom YOLO siap (preload %s)", YOLO_CUSTOM_MODEL)
+        except Exception:  # pragma: no cover - bergantung file model
+            logger.exception("gagal memuat model custom YOLO saat startup")
     yield
 
 
@@ -102,6 +112,22 @@ YOLO_AGNOSTIC_NMS = env_bool("YOLO_AGNOSTIC_NMS", False)
 YOLO_THREADS = int(os.getenv("YOLO_THREADS", "0"))
 # Muat model lebih awal saat startup agar request /detect pertama tidak lambat.
 YOLO_PRELOAD = env_bool("YOLO_PRELOAD", True)
+
+# Model deteksi hasil latihan sendiri (fine-tune). Bila diisi, /detect menjalankan
+# model COCO utama DAN model custom ini, lalu menggabungkan kotaknya, sehingga
+# kelas COCO lama tetap terlihat sekaligus objek yang Anda ajari. Relatif terhadap
+# folder python-service/ bila bukan path absolut.
+YOLO_CUSTOM_MODEL = os.getenv("YOLO_CUSTOM_MODEL", "").strip()
+YOLO_CUSTOM_CONF = float(os.getenv("YOLO_CUSTOM_CONF", str(YOLO_CONF)))
+
+# Penyimpanan dataset "Ajar Objek" (hasil anotasi dari kamera). Tidak di-commit.
+DATASET_DIR = os.getenv("DATASET_DIR", os.path.join(SERVICE_DIR, "datasets"))
+ANNOTATE_DIR = os.path.join(DATASET_DIR, "objek")
+ANNOTATE_IMAGES = os.path.join(ANNOTATE_DIR, "raw", "images")
+ANNOTATE_LABELS = os.path.join(ANNOTATE_DIR, "raw", "labels")
+CLASSES_FILE = os.path.join(ANNOTATE_DIR, "classes.txt")
+LABEL_MAX_LEN = 40
+MIN_BOX_SIDE = 0.01
 
 if YOLO_THREADS > 0:
     try:
@@ -177,6 +203,12 @@ VISION_RULES = (
 model = None
 model_lock = threading.Lock()
 
+custom_model = None
+custom_model_lock = threading.Lock()
+custom_model_missing = False
+
+dataset_lock = threading.Lock()
+
 gemini_client = None
 gemini_lock = threading.Lock()
 
@@ -208,6 +240,31 @@ def get_model():
                 logger.info("memuat model YOLO %s", MODEL_NAME)
                 model = YOLO(MODEL_NAME)
     return model
+
+
+def get_custom_model():
+    """Muat model YOLO hasil latihan sendiri bila dikonfigurasi dan ada."""
+    global custom_model, custom_model_missing
+    if not YOLO_CUSTOM_MODEL or custom_model_missing:
+        return None
+    if custom_model is None:
+        with custom_model_lock:
+            if custom_model is None:
+                path = YOLO_CUSTOM_MODEL
+                if not os.path.isabs(path):
+                    candidate = os.path.join(SERVICE_DIR, path)
+                    if os.path.exists(candidate):
+                        path = candidate
+                if not os.path.exists(path):
+                    logger.warning(
+                        "YOLO_CUSTOM_MODEL=%s tidak ditemukan; model custom diabaikan.",
+                        YOLO_CUSTOM_MODEL,
+                    )
+                    custom_model_missing = True
+                    return None
+                logger.info("memuat model custom YOLO %s", path)
+                custom_model = YOLO(path)
+    return custom_model
 
 
 def gemini_configured() -> bool:
@@ -252,11 +309,12 @@ async def read_image(upload: UploadFile) -> Image.Image:
         raise HTTPException(status_code=400, detail="File bukan gambar yang valid.")
 
 
-def run_yolo(image: Image.Image, conf: float | None = None) -> list[dict]:
+def run_yolo(image: Image.Image, conf: float | None = None, model=None) -> list[dict]:
     """Jalankan YOLO dan kembalikan daftar kotak. Blocking; panggil via threadpool."""
     if conf is None:
         conf = YOLO_CONF
-    result = get_model().predict(
+    detector = model if model is not None else get_model()
+    result = detector.predict(
         image,
         imgsz=YOLO_IMGSZ,
         conf=conf,
@@ -276,6 +334,18 @@ def run_yolo(image: Image.Image, conf: float | None = None) -> list[dict]:
             "confidence": round(confidence, 3),
             "box": [x1, y1, x2, y2],
         })
+    return boxes
+
+
+def run_detection(image: Image.Image) -> list[dict]:
+    """Gabungkan deteksi model COCO utama dengan model custom (bila dikonfigurasi)."""
+    boxes = run_yolo(image)
+    custom = get_custom_model()
+    if custom is not None:
+        try:
+            boxes = boxes + run_yolo(image, conf=YOLO_CUSTOM_CONF, model=custom)
+        except Exception:  # pragma: no cover - bergantung file model
+            logger.exception("deteksi model custom gagal; memakai model utama saja")
     return boxes
 
 
@@ -628,6 +698,138 @@ def call_ollama(encoded: str, hints: list[dict], meta: dict) -> dict:
         raise VisionServiceError(502, f"Analisis vision gagal: {exc}", f"ollama error {exc}")
 
 
+def read_classes() -> list[str]:
+    """Baca daftar nama kelas dari classes.txt (indeks = urutan baris)."""
+    if not os.path.exists(CLASSES_FILE):
+        return []
+    try:
+        with open(CLASSES_FILE, encoding="utf-8") as handle:
+            return [line.strip() for line in handle if line.strip()]
+    except OSError:
+        logger.warning("tidak dapat membaca classes.txt")
+        return []
+
+
+def ensure_class(label: str) -> tuple[list[str], int]:
+    """Tambahkan kelas baru bila belum ada; kembalikan daftar kelas + indeksnya."""
+    with dataset_lock:
+        classes = read_classes()
+        if label in classes:
+            return classes, classes.index(label)
+        classes.append(label)
+        os.makedirs(os.path.dirname(CLASSES_FILE), exist_ok=True)
+        with open(CLASSES_FILE, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(classes) + "\n")
+        return classes, len(classes) - 1
+
+
+def slug(text: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return (cleaned or "objek")[:32]
+
+
+def normalize_box(x1, y1, x2, y2) -> tuple[float, float, float, float]:
+    """Ubah kotak (x1,y1,x2,y2) ternormalisasi 0..1 menjadi cx,cy,w,h YOLO."""
+    left, right = sorted((float(x1), float(x2)))
+    top, bottom = sorted((float(y1), float(y2)))
+    left, right = min(max(left, 0.0), 1.0), min(max(right, 0.0), 1.0)
+    top, bottom = min(max(top, 0.0), 1.0), min(max(bottom, 0.0), 1.0)
+    return (left + right) / 2, (top + bottom) / 2, right - left, bottom - top
+
+
+def save_annotation(image, image_path, label_path, class_id, cx, cy, w, h) -> None:
+    """Blocking; simpan gambar + file label YOLO. Panggil via threadpool."""
+    image.convert("RGB").save(image_path, format="JPEG", quality=90)
+    with open(label_path, "w", encoding="utf-8") as handle:
+        handle.write(f"{class_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n")
+
+
+def dataset_counts() -> dict:
+    """Hitung jumlah contoh per kelas dari folder label."""
+    counts: dict[str, int] = {}
+    total = 0
+    if os.path.isdir(ANNOTATE_LABELS):
+        classes = read_classes()
+        for name in os.listdir(ANNOTATE_LABELS):
+            if not name.endswith(".txt"):
+                continue
+            total += 1
+            try:
+                with open(os.path.join(ANNOTATE_LABELS, name), encoding="utf-8") as handle:
+                    first = handle.readline().split()
+                if first:
+                    idx = int(float(first[0]))
+                    label = classes[idx] if 0 <= idx < len(classes) else str(idx)
+                    counts[label] = counts.get(label, 0) + 1
+            except (OSError, ValueError):
+                continue
+    return {"total": total, "classes": counts, "class_list": read_classes()}
+
+
+@app.post("/annotate")
+async def annotate(
+    file: UploadFile = File(...),
+    label: str = Form(...),
+    x1: float = Form(...),
+    y1: float = Form(...),
+    x2: float = Form(...),
+    y2: float = Form(...),
+):
+    """Simpan satu contoh berlabel dari kamera untuk melatih model custom."""
+    label = (label or "").strip()
+    if not label:
+        raise HTTPException(status_code=400, detail="Nama objek wajib diisi.")
+    if len(label) > LABEL_MAX_LEN:
+        raise HTTPException(status_code=400, detail=f"Nama objek maksimum {LABEL_MAX_LEN} karakter.")
+
+    image = await read_image(file)
+    cx, cy, w, h = normalize_box(x1, y1, x2, y2)
+    if w < MIN_BOX_SIDE or h < MIN_BOX_SIDE:
+        raise HTTPException(status_code=400, detail="Kotak terlalu kecil; gambar kotak yang lebih besar.")
+
+    classes, class_id = ensure_class(label)
+    os.makedirs(ANNOTATE_IMAGES, exist_ok=True)
+    os.makedirs(ANNOTATE_LABELS, exist_ok=True)
+    stem = f"{slug(label)}_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+    image_path = os.path.join(ANNOTATE_IMAGES, stem + ".jpg")
+    label_path = os.path.join(ANNOTATE_LABELS, stem + ".txt")
+
+    try:
+        await run_in_threadpool(save_annotation, image, image_path, label_path, class_id, cx, cy, w, h)
+    except OSError as exc:
+        logger.exception("gagal menyimpan anotasi")
+        raise HTTPException(status_code=500, detail=f"Gagal menyimpan contoh: {exc}")
+
+    counts = dataset_counts()
+    logger.info(
+        "annotate tersimpan label=%s kelas=%d total=%d",
+        label, class_id, counts["total"],
+    )
+    return {
+        "saved": True,
+        "label": label,
+        "class_id": class_id,
+        "class_list": classes,
+        "total": counts["total"],
+        "classes": counts["classes"],
+    }
+
+
+@app.get("/dataset")
+def dataset():
+    """Ringkasan data 'Ajar Objek' yang terkumpul."""
+    counts = dataset_counts()
+    return {
+        "total": counts["total"],
+        "classes": counts["classes"],
+        "class_list": counts["class_list"],
+        "custom_model": YOLO_CUSTOM_MODEL or None,
+        "custom_model_active": get_custom_model() is not None,
+        "dir": ANNOTATE_DIR,
+        "hint": "Latih ulang model lalu set YOLO_CUSTOM_MODEL agar objek ajaran terdeteksi.",
+    }
+
+
 @app.get("/health")
 def health():
     provider, reason = choose_provider()
@@ -638,6 +840,8 @@ def health():
         "vision_model": active_model,
         "provider_reason": reason,
         "yolo_model": MODEL_NAME,
+        "yolo_custom_model": YOLO_CUSTOM_MODEL or None,
+        "yolo_custom_active": get_custom_model() is not None,
         "yolo_imgsz": YOLO_IMGSZ,
         "yolo_conf": YOLO_CONF,
         "yolo_iou": YOLO_IOU,
@@ -656,7 +860,7 @@ async def detect(file: UploadFile = File(...)):
     started = time.perf_counter()
     image = await read_image(file)
     try:
-        boxes = await run_in_threadpool(run_yolo, image)
+        boxes = await run_in_threadpool(run_detection, image)
     except Exception as exc:
         logger.exception("detect gagal")
         raise HTTPException(status_code=500, detail=f"Deteksi gagal: {exc}")
@@ -675,6 +879,7 @@ async def detect(file: UploadFile = File(...)):
         "boxes": boxes,
         "counts": dict(counts),
         "model": MODEL_NAME,
+        "custom_model": YOLO_CUSTOM_MODEL or None,
         "elapsed_ms": round(elapsed * 1000),
         "note": "Deteksi YOLO pretrained; kategori di luar kelas model mungkin tidak terdeteksi.",
     }
@@ -688,7 +893,7 @@ async def describe(file: UploadFile = File(...)):
     # Petunjuk YOLO dipakai hanya sebagai bukti pendukung, bukan kebenaran mutlak.
     hints: list[dict] = []
     try:
-        boxes = await run_in_threadpool(run_yolo, image)
+        boxes = await run_in_threadpool(run_detection, image)
         hints = yolo_hints(boxes)
     except Exception:
         logger.exception("YOLO gagal saat menyiapkan petunjuk describe")

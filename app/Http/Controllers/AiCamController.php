@@ -23,6 +23,53 @@ class AiCamController extends Controller
         return $this->forwardImage($request, '/describe', 190);
     }
 
+    public function annotate(Request $request)
+    {
+        $request->validate([
+            'image' => ['required', 'file', 'image', 'mimes:jpg,jpeg,png,webp', 'max:8192'],
+            'label' => ['required', 'string', 'max:40'],
+            'x1' => ['required', 'numeric', 'between:0,1'],
+            'y1' => ['required', 'numeric', 'between:0,1'],
+            'x2' => ['required', 'numeric', 'between:0,1'],
+            'y2' => ['required', 'numeric', 'between:0,1'],
+        ]);
+
+        $file = $request->file('image');
+
+        try {
+            $response = Http::timeout(20)
+                ->attach('file', file_get_contents($file->getRealPath()), $file->getClientOriginalName())
+                ->post($this->baseUrl().'/annotate', [
+                    'label' => $request->input('label'),
+                    'x1' => $request->input('x1'),
+                    'y1' => $request->input('y1'),
+                    'x2' => $request->input('x2'),
+                    'y2' => $request->input('y2'),
+                ]);
+
+            return response()->json($response->json() ?? [
+                'message' => 'Layanan Python mengembalikan respons yang tidak valid.',
+            ], $response->status());
+        } catch (ConnectionException $e) {
+            return response()->json([
+                'message' => 'Layanan Python tidak dapat dihubungi. Pastikan FastAPI berjalan di port 8001.',
+            ], 503);
+        }
+    }
+
+    public function dataset()
+    {
+        try {
+            $response = Http::timeout(10)->get($this->baseUrl().'/dataset');
+
+            return response()->json($response->json() ?? ['total' => 0], $response->status());
+        } catch (ConnectionException $e) {
+            return response()->json([
+                'message' => 'Layanan Python tidak dapat dihubungi. Pastikan FastAPI berjalan di port 8001.',
+            ], 503);
+        }
+    }
+
     public function health()
     {
         try {

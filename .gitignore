@@ -7,6 +7,9 @@
 __pycache__/
 *.py[cod]
 *.pt
+# Hasil anotasi "Ajar Objek" + log training (privasi & ukuran besar)
+python-service/datasets/
+python-service/runs/
 .env.backup
 .env.production
 .phpactor.json

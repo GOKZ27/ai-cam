@@ -53,6 +53,9 @@ apa yang ada di depan kamera, tanpa perlu menekan tombol berulang kali.
 11. **Diagnostik Sistem (self‑test)** — tombol "Jalankan Uji" mengukur kecepatan server,
     kamera, YOLO, Vision AI, dan suara, menandai tiap bagian **Optimal / Bisa lebih baik /
     Bermasalah**, lalu merangkum bagian mana yang **belum maksimal**.
+12. **Mode "Ajar Objek"** — bekukan gambar, tarik kotak pada benda baru, lalu ketik
+    namanya. Contoh tersimpan sebagai **data latih** agar model bisa mengenali benda
+    di luar 80 kategori standar (COCO) setelah dilatih ulang.
 
 ---
 
@@ -236,6 +239,8 @@ ai-cam/
 | GET | `/api/ai-cam/health` | Status layanan (provider & model aktif) |
 | POST | `/api/ai-cam/detect` | Deteksi objek (YOLO) → JSON kotak + label |
 | POST | `/api/ai-cam/describe` | Deskripsi lingkungan (Gemini/Ollama) → JSON teks |
+| POST | `/api/ai-cam/annotate` | Simpan contoh ajar (gambar + kotak + label) → JSON jumlah data |
+| GET | `/api/ai-cam/dataset` | Ringkasan data ajar terkumpul (jumlah per kelas) |
 
 Contoh respons `/describe` (disederhanakan):
 ```json
@@ -264,6 +269,9 @@ Semua pengaturan AI ada di `python-service/.env` (disalin dari `.env.example`):
 | `GEMINI_FALLBACK_MODELS` | Model cadangan (mis. `gemini-3.5-flash-lite`) |
 | `GEMINI_THINKING_LEVEL` | Tingkat "berpikir" Gemini (`LOW` = lebih cepat) |
 | `YOLO_MODEL`, `YOLO_IMGSZ`, `YOLO_CONF` | Tuning deteksi lokal (`yolo11n.pt` @ 640 = realtime) |
+| `YOLO_CUSTOM_MODEL` | Model hasil latihan sendiri (mis. `custom.pt`); kosong = nonaktif |
+| `YOLO_CUSTOM_CONF` | Ambang keyakinan khusus model hasil latihan |
+| `DATASET_DIR` | Lokasi data ajar (mis. `python-service/datasets/objek`) |
 | `OLLAMA_MODEL`, `OLLAMA_TIMEOUT` | Model & batas waktu Ollama |
 | `VISION_MAX_SIDE`, `VISION_JPEG_QUALITY` | Kualitas gambar yang dikirim |
 
@@ -296,6 +304,7 @@ Semua pengaturan AI ada di `python-service/.env` (disalin dari `.env.example`):
 | 14 | Penyimpanan riwayat ke database | ⛔ | Belum (SQLite belum dipakai) |
 | 15 | Deploy ke server publik | ⛔ | Masih lokal (localhost) |
 | 16 | Mode offline penuh / optimasi mobile | ⛔ | Belum |
+| 17 | Mode "Ajar Objek" (kumpul data latih) | ✅ | Berjalan; pelatihan model khusus menyusul |
 
 ### Mengapa disebut ± 50 %?
 - **Sudah jalan (inti produk):** alur lengkap kamera → deteksi → deskripsi → suara,
@@ -366,8 +375,8 @@ node tests/js/speech-dedupe.test.mjs                        # 8 tes JS
 
 ## 13. Rencana Pengembangan (Roadmap)
 
-1. **Data & akurasi:** kumpulkan foto nyata (botol, gelas, remote, benda kecil/jauh,
-   kondisi gelap) → ukur dan tingkatkan akurasi.
+1. **Data & akurasi:** kumpulkan foto nyata lewat mode **"Ajar Objek"** (botol, gelas,
+   remote, benda kecil/jauh, kondisi gelap) → latih model khusus (YOLO) lalu ukur akurasinya.
 2. **Performa:** sesuaikan model YOLO & resolusi agar halus di perangkat lemah.
 3. **Riwayat & database:** simpan log analisis memakai SQLite/MySQL.
 4. **Autentikasi:** login pengguna dan preferensi tersimpan.

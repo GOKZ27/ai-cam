@@ -101,7 +101,7 @@
         .error { margin:12px 0 0; padding:12px 14px; border-radius:12px; background:var(--danger-bg); color:var(--danger); border:1px solid rgba(255,120,150,.42); font-weight:600; }
         .settings { margin-top:16px; display:flex; flex-wrap:wrap; align-items:center; gap:12px; background:var(--panel-2); border:1px solid var(--line); border-radius:14px; padding:12px 14px; }
         .settings label { font-weight:700; font-size:.9rem; color:var(--muted); }
-        select, input[type="number"] { font-family:inherit; font-size:.95rem; color:var(--text); background:#0b1424; border:1px solid var(--line-strong); border-radius:11px; padding:10px 12px; min-height:48px; }
+        select, input[type="number"], input[type="text"] { font-family:inherit; font-size:.95rem; color:var(--text); background:#0b1424; border:1px solid var(--line-strong); border-radius:11px; padding:10px 12px; min-height:48px; }
         .indicators { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
         .indicator {
             position:relative; background:var(--panel-3); border:1px solid var(--line); border-radius:13px;
@@ -131,6 +131,14 @@
         footer.foot strong { color:var(--warn); }
         .hint { font-size:.85rem; color:var(--muted); margin:12px 0 0; }
         .notice { margin:14px 0 0; padding:12px 14px; border-radius:12px; background:rgba(120,95,15,.26); color:#ffe6a6; border:1px solid rgba(255,212,121,.4); font-size:.9rem; }
+        .teach { margin-top:16px; background:rgba(124,157,255,.1); border:1px solid rgba(124,157,255,.42); border-radius:14px; padding:14px; }
+        .teach-title { margin:0; font-weight:800; font-size:.96rem; }
+        .teach-row { display:flex; flex-wrap:wrap; gap:10px; margin-top:10px; align-items:center; }
+        .teach-row input[type="text"] { flex:1 1 220px; min-width:0; }
+        .teach-classes { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+        .teach-chip { display:inline-flex; align-items:center; gap:6px; background:var(--panel-2); border:1px solid var(--line); border-radius:999px; padding:5px 12px; font-size:.82rem; font-weight:700; }
+        .teach-chip b { color:var(--accent); }
+        .stage canvas.teaching { pointer-events:auto; cursor:crosshair; touch-action:none; }
         .diag-panel { margin-top:18px; }
         .diag-summary { font-weight:800; margin:8px 0 0; color:var(--muted); }
         .diag-summary[data-state="busy"] { color:var(--warn); }
@@ -199,6 +207,7 @@
                 <button id="pause" type="button" class="secondary" disabled aria-pressed="false">Jeda</button>
                 <button id="sound" type="button" class="secondary" aria-pressed="true">Suara: Aktif</button>
                 <button id="analyze" type="button" class="secondary" disabled>Analisis Sekarang</button>
+                <button id="teach" type="button" class="secondary" disabled aria-pressed="false">Ajar Objek</button>
                 <button id="stop" type="button" class="danger" disabled>Berhenti</button>
             </div>
 
@@ -216,6 +225,18 @@
                     <option value="60000">60 detik</option>
                 </select>
                 <span id="cameraHint" class="muted" style="font-size:.84rem">Pilih <strong>Iriun Webcam</strong> bila memakai kamera HP sebagai sumber gambar.</span>
+            </div>
+
+            <div id="teachPanel" class="teach" hidden>
+                <p class="teach-title">Ajar objek baru</p>
+                <p class="hint" style="margin-top:4px">Gambar di pratinjau <strong>dibekukan</strong>. Tarik kotak pada objek, ketik namanya, lalu Simpan. Contoh ini terkumpul sebagai data latih; objek akan dikenali setelah model dilatih ulang (lihat DOKUMENTASI/Ajar Objek).</p>
+                <div class="teach-row">
+                    <input id="teachLabel" type="text" maxlength="40" placeholder="Nama objek, mis. &quot;botol hijau&quot;" aria-label="Nama objek">
+                    <button id="teachSave" type="button" disabled>Simpan contoh</button>
+                    <button id="teachCancel" type="button" class="secondary">Batal</button>
+                </div>
+                <p id="teachStatus" class="meta" role="status" aria-live="polite"></p>
+                <div id="teachClasses" class="teach-classes"></div>
             </div>
 
             <p id="status" class="status" role="status" aria-live="polite">Tekan “Mulai Realtime” untuk mengaktifkan kamera dan analisis otomatis.</p>
@@ -311,11 +332,20 @@
     const cameraHint = byId('cameraHint');
     const diagRun = byId('diagRun');
     const diagSummary = byId('diagSummary');
+    const teachBtn = byId('teach');
+    const teachPanel = byId('teachPanel');
+    const teachLabelInput = byId('teachLabel');
+    const teachSaveBtn = byId('teachSave');
+    const teachCancelBtn = byId('teachCancel');
+    const teachStatus = byId('teachStatus');
+    const teachClasses = byId('teachClasses');
 
     const CSRF = document.querySelector('meta[name="csrf-token"]').content;
     const DETECT_URL = '/api/ai-cam/detect';
     const DESCRIBE_URL = '/api/ai-cam/describe';
     const HEALTH_URL = '/api/ai-cam/health';
+    const ANNOTATE_URL = '/api/ai-cam/annotate';
+    const DATASET_URL = '/api/ai-cam/dataset';
 
     const CONF_MIN = 0.5;
     const DETECT_INTERVAL = 1200;
@@ -351,6 +381,10 @@
     let lastAnnouncedAt = 0;
     let lastVisionKey = '';
     let diagRunning = false;
+    let teaching = false;
+    let teachSource = null;
+    let teachBox = null;
+    let teachPointer = null;
 
     const namesID = {
         person:'orang', bicycle:'sepeda', car:'mobil', motorcycle:'sepeda motor',
@@ -507,6 +541,231 @@
         return postBlob(url, blob, timeoutMs);
     }
 
+    function escapeHtml(text) {
+        return String(text).replace(/[&<>"']/g, (char) => (
+            { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]
+        ));
+    }
+
+    function normalizedBox(box) {
+        if (!box) return null;
+        return {
+            x1: Math.min(box.x1, box.x2), x2: Math.max(box.x1, box.x2),
+            y1: Math.min(box.y1, box.y2), y2: Math.max(box.y1, box.y2)
+        };
+    }
+
+    function canvasToBlob(source, quality) {
+        return new Promise((resolve, reject) => {
+            source.toBlob(
+                (blob) => (blob ? resolve(blob) : reject(new Error('Gagal membuat gambar.'))),
+                'image/jpeg',
+                quality
+            );
+        });
+    }
+
+    function teachMetrics() {
+        const rect = canvas.getBoundingClientRect();
+        const vw = teachSource ? teachSource.width : 1;
+        const vh = teachSource ? teachSource.height : 1;
+        const scale = Math.min(rect.width / vw, rect.height / vh);
+        const dw = vw * scale, dh = vh * scale;
+        return { rect, dw, dh, dx: (rect.width - dw) / 2, dy: (rect.height - dh) / 2 };
+    }
+
+    function pointToNormalized(event) {
+        const { rect, dw, dh, dx, dy } = teachMetrics();
+        const x = (event.clientX - rect.left - dx) / dw;
+        const y = (event.clientY - rect.top - dy) / dh;
+        return { x: Math.min(Math.max(x, 0), 1), y: Math.min(Math.max(y, 0), 1) };
+    }
+
+    function drawTeaching() {
+        if (!teachSource) return;
+        const rect = canvas.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = Math.round(rect.width * dpr);
+        canvas.height = Math.round(rect.height * dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, rect.width, rect.height);
+        const { dw, dh, dx, dy } = teachMetrics();
+        ctx.drawImage(teachSource, dx, dy, dw, dh);
+        const box = normalizedBox(teachBox);
+        if (box && (box.x2 - box.x1) > 0 && (box.y2 - box.y1) > 0) {
+            const x = dx + box.x1 * dw, y = dy + box.y1 * dh;
+            const w = (box.x2 - box.x1) * dw, h = (box.y2 - box.y1) * dh;
+            ctx.fillStyle = 'rgba(124,157,255,.18)';
+            ctx.fillRect(x, y, w, h);
+            ctx.strokeStyle = '#7c9dff';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(x, y, w, h);
+            const label = teachLabelInput.value.trim() || 'objek';
+            ctx.font = 'bold 13px system-ui';
+            ctx.fillStyle = '#7c9dff';
+            ctx.fillText(label, x + 5, Math.max(14, y - 6));
+        }
+    }
+
+    function updateTeachSave() {
+        const box = normalizedBox(teachBox);
+        const hasBox = box && (box.x2 - box.x1) >= 0.01 && (box.y2 - box.y1) >= 0.01;
+        teachSaveBtn.disabled = !(hasBox && teachLabelInput.value.trim().length > 0);
+    }
+
+    function renderTeachClasses(classes) {
+        const entries = Object.entries(classes || {});
+        if (!entries.length) {
+            teachClasses.innerHTML = '<span class="muted">Belum ada objek yang diajari.</span>';
+            return;
+        }
+        teachClasses.innerHTML = entries
+            .sort((a, b) => b[1] - a[1])
+            .map(([name, count]) => '<span class="teach-chip">' + escapeHtml(name) + ' <b>' + count + '</b></span>')
+            .join('');
+    }
+
+    async function refreshDataset() {
+        try {
+            const response = await fetch(DATASET_URL, { headers: { 'Accept': 'application/json' } });
+            const data = await response.json().catch(() => ({}));
+            renderTeachClasses(data.classes || {});
+            if (typeof data.total === 'number') {
+                const objectCount = Object.keys(data.classes || {}).length;
+                teachStatus.textContent = data.total > 0
+                    ? data.total + ' contoh terkumpul untuk ' + objectCount + ' objek.'
+                    : 'Belum ada contoh. Tandai objek untuk mulai mengajari sistem.';
+            }
+        } catch (error) { /* diabaikan */ }
+    }
+
+    function startTeaching() {
+        if (!running || !video.videoWidth) {
+            setStatus('Nyalakan kamera dulu untuk mengajari objek.');
+            return;
+        }
+        teaching = true;
+        clearTimeout(timer);
+        clearTimeout(visionTimer);
+        cancelSpeech();
+        const frozen = document.createElement('canvas');
+        frozen.width = video.videoWidth;
+        frozen.height = video.videoHeight;
+        frozen.getContext('2d').drawImage(video, 0, 0, frozen.width, frozen.height);
+        teachSource = frozen;
+        teachBox = null;
+        teachPointer = null;
+        teachLabelInput.value = '';
+        teachPanel.hidden = false;
+        teachBtn.setAttribute('aria-pressed', 'true');
+        canvas.classList.add('teaching');
+        drawTeaching();
+        updateTeachSave();
+        setBadge('Mode ajar', 'paused');
+        setIndicator(statYolo, 'YOLO', 'Dijeda (ajar)', '');
+        setStatus('Mode ajar: tarik kotak pada objek, ketik namanya, lalu Simpan. Tekan Batal untuk keluar.');
+        refreshDataset();
+        teachLabelInput.focus();
+    }
+
+    function stopTeaching(resume) {
+        const wasTeaching = teaching;
+        teaching = false;
+        teachPointer = null;
+        teachBox = null;
+        teachSource = null;
+        teachPanel.hidden = true;
+        teachBtn.setAttribute('aria-pressed', 'false');
+        canvas.classList.remove('teaching');
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        if (resume !== false && wasTeaching && running) {
+            detectErrors = 0;
+            setBadge('Kamera aktif', 'on');
+            setIndicator(statYolo, 'YOLO', 'Aktif', 'ok');
+            setStatus('Keluar dari mode ajar. Mengamati lingkungan…');
+            detectLoop();
+            if (!visionBusy) runVisionAnalysis();
+        }
+    }
+
+    async function saveAnnotation() {
+        if (!teaching || !teachSource) return;
+        const label = teachLabelInput.value.trim();
+        if (!label) { setStatus('Ketik nama objek dulu.'); teachLabelInput.focus(); return; }
+        const box = normalizedBox(teachBox);
+        if (!box || (box.x2 - box.x1) < 0.01 || (box.y2 - box.y1) < 0.01) {
+            setStatus('Gambar kotak pada objek dulu (agak besar).');
+            return;
+        }
+        teachSaveBtn.disabled = true;
+        teachSaveBtn.textContent = 'Menyimpan…';
+        try {
+            const blob = await canvasToBlob(teachSource, 0.9);
+            const form = new FormData();
+            form.append('image', blob, 'ajar.jpg');
+            form.append('label', label);
+            form.append('x1', box.x1.toFixed(5));
+            form.append('y1', box.y1.toFixed(5));
+            form.append('x2', box.x2.toFixed(5));
+            form.append('y2', box.y2.toFixed(5));
+            const controller = new AbortController();
+            const abort = setTimeout(() => controller.abort(), 20000);
+            let response;
+            try {
+                response = await fetch(ANNOTATE_URL, {
+                    method: 'POST',
+                    headers: { 'X-CSRF-TOKEN': CSRF, 'Accept': 'application/json' },
+                    body: form,
+                    signal: controller.signal
+                });
+            } finally {
+                clearTimeout(abort);
+            }
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(data.detail || data.message || ('Gagal menyimpan (' + response.status + ')'));
+            }
+            teachStatus.textContent = 'Tersimpan: ' + label + ' • total ' + data.total + ' contoh.';
+            renderTeachClasses(data.classes || {});
+            teachBox = null;
+            teachPointer = null;
+            teachLabelInput.value = '';
+            drawTeaching();
+            speak('Contoh ' + label + ' tersimpan.');
+        } catch (error) {
+            teachStatus.textContent = 'Gagal menyimpan: ' + (error.name === 'AbortError' ? 'waktu habis.' : error.message);
+        } finally {
+            teachSaveBtn.textContent = 'Simpan contoh';
+            updateTeachSave();
+        }
+    }
+
+    function onTeachPointerDown(event) {
+        if (!teaching || !teachSource) return;
+        event.preventDefault();
+        try { canvas.setPointerCapture(event.pointerId); } catch (error) { /* diabaikan */ }
+        const point = pointToNormalized(event);
+        teachPointer = point;
+        teachBox = { x1: point.x, y1: point.y, x2: point.x, y2: point.y };
+        drawTeaching();
+    }
+
+    function onTeachPointerMove(event) {
+        if (!teaching || !teachSource || !teachPointer) return;
+        event.preventDefault();
+        const point = pointToNormalized(event);
+        teachBox = { x1: teachPointer.x, y1: teachPointer.y, x2: point.x, y2: point.y };
+        drawTeaching();
+        updateTeachSave();
+    }
+
+    function onTeachPointerUp(event) {
+        if (!teaching || !teachPointer) return;
+        try { canvas.releasePointerCapture(event.pointerId); } catch (error) { /* diabaikan */ }
+        teachPointer = null;
+        updateTeachSave();
+    }
+
     function drawBoxes(data) {
         lastData = data;
         const rect = video.getBoundingClientRect();
@@ -612,18 +871,18 @@
 
     function scheduleDetect() {
         clearTimeout(timer);
-        if (!running || paused) return;
+        if (!running || paused || teaching) return;
         let delay = busy || visionBusy ? DETECT_INTERVAL_BUSY : DETECT_INTERVAL;
         if (detectErrors) delay = Math.min(DETECT_INTERVAL * Math.pow(2, Math.max(0, detectErrors - 1)), DETECT_MAX_INTERVAL);
         timer = setTimeout(detectLoop, delay);
     }
 
     async function detectLoop() {
-        if (!running || paused || busy) return;
+        if (!running || paused || busy || teaching) return;
         busy = true;
         try {
             const data = await postImage(DETECT_URL, DETECT_TIMEOUT, { maxSide: 960, quality: 0.7 });
-            if (!running || paused) return;
+            if (!running || paused || teaching) return;
             detectErrors = 0;
             drawBoxes(data);
             renderObjects(data);
@@ -649,18 +908,18 @@
 
     function scheduleVision() {
         clearTimeout(visionTimer);
-        if (!running || paused) return;
+        if (!running || paused || teaching) return;
         visionTimer = setTimeout(runVisionAnalysis, visionIntervalMs);
     }
 
     async function runVisionAnalysis() {
-        if (!running || paused || visionBusy) return;
+        if (!running || paused || visionBusy || teaching) return;
         visionBusy = true;
         const started = performance.now();
         setIndicator(statVision, 'Vision AI', 'Menganalisis…', 'busy');
         try {
             const data = await postImage(DESCRIBE_URL, DESCRIBE_TIMEOUT, { maxSide: 1024, quality: 0.85 });
-            if (!running || paused) return;
+            if (!running || paused || teaching) return;
             const text = (data.description || '').trim();
             if (!text) throw new Error('Model tidak mengembalikan deskripsi.');
             visionHealthy = true;
@@ -978,6 +1237,7 @@
             pauseBtn.setAttribute('aria-pressed', 'false');
             pauseBtn.textContent = 'Jeda';
             analyzeBtn.disabled = false;
+            teachBtn.disabled = false;
             stopBtn.disabled = false;
             watchCameraTracks();
             refreshCameraList();
@@ -1041,6 +1301,8 @@
     function stopAssistant() {
         running = false;
         paused = false;
+        if (teaching) stopTeaching(false);
+        teachBtn.disabled = true;
         clearTimeout(timer);
         clearTimeout(visionTimer);
         timer = null;
@@ -1077,7 +1339,8 @@
             const response = await fetch(HEALTH_URL, { headers: { 'Accept': 'application/json' } });
             if (!response.ok) throw new Error('unhealthy');
             const data = await response.json();
-            statModel.textContent = 'Model: ' + (data.yolo_model || '-');
+            statModel.textContent = 'Model: ' + (data.yolo_model || '-')
+                + (data.yolo_custom_active ? ' + ' + (data.yolo_custom_model || 'custom') : '');
             const provider = data.vision_provider || 'ollama';
             const modelLabel = data.vision_model ? ' • ' + data.vision_model : '';
             statProvider.textContent = 'Penyedia: ' + providerName(provider) + modelLabel;
@@ -1106,6 +1369,23 @@
     analyzeBtn.addEventListener('click', () => { if (running && !visionBusy) runVisionAnalysis(); });
     stopBtn.addEventListener('click', stopAssistant);
     diagRun.addEventListener('click', runDiagnostics);
+    teachBtn.addEventListener('click', () => { if (teaching) { stopTeaching(true); } else { startTeaching(); } });
+    teachSaveBtn.addEventListener('click', saveAnnotation);
+    teachCancelBtn.addEventListener('click', () => stopTeaching(true));
+    teachLabelInput.addEventListener('input', () => { updateTeachSave(); drawTeaching(); });
+    teachLabelInput.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            if (!teachSaveBtn.disabled) saveAnnotation();
+        } else if (event.key === 'Escape') {
+            event.preventDefault();
+            stopTeaching(true);
+        }
+    });
+    canvas.addEventListener('pointerdown', onTeachPointerDown);
+    canvas.addEventListener('pointermove', onTeachPointerMove);
+    canvas.addEventListener('pointerup', onTeachPointerUp);
+    canvas.addEventListener('pointercancel', onTeachPointerUp);
     intervalSelect.addEventListener('change', () => {
         applyInterval(intervalSelect.value);
         try { localStorage.setItem('aicamVisionInterval', intervalSelect.value); } catch (error) {}
@@ -1116,7 +1396,9 @@
     }
     window.addEventListener('beforeunload', stopAssistant);
     window.addEventListener('resize', () => {
-        if (lastData) {
+        if (teaching) {
+            drawTeaching();
+        } else if (lastData) {
             drawBoxes(lastData);
         } else if (video.videoWidth) {
             drawBoxes({ image_width: video.videoWidth, image_height: video.videoHeight, boxes: [] });
